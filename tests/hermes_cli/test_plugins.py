@@ -17,6 +17,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    _HookRegistration,
     _dispatch_pre_tool_call_hooks,
     get_plugin_command_handler,
     get_plugin_commands,
@@ -1072,6 +1073,43 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         mgr._hooks["post_tool_call"] = [boom, lambda **_kw: "survived"]
         assert mgr.invoke_hook("post_tool_call") == ["survived"]
+
+    def test_hook_diagnostics_use_sanitized_owner_and_exception_class(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        def boom(**_kwargs):
+            raise RuntimeError("credential=[REDACTED]")
+
+        boom.__module__ = "unsafe\nmodule"
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [
+            _HookRegistration(boom, "unsafe\nplugin=[REDACTED]")
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            assert mgr.invoke_hook("post_tool_call", payload="[REDACTED]") == []
+
+        assert "plugin:unsafe_plugin__REDACTED_" in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert "credential=" not in caplog.text
+        assert "payload=" not in caplog.text
+        assert "\nmodule" not in caplog.text
+
+    def test_iter_hook_callbacks_exposes_raw_callback_after_registration(self):
+        callback = lambda **_kwargs: None
+        mgr = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="ownership_probe", key="ownership_probe"), mgr
+        )
+
+        context.register_hook("post_tool_call", callback)
+
+        assert isinstance(mgr._hooks["post_tool_call"][0], _HookRegistration)
+        assert mgr.iter_hook_callbacks("post_tool_call") == (callback,)
 
     def test_hook_callback_timeout_reads_config(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes_test"

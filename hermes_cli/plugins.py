@@ -1227,6 +1227,14 @@ class LoadedPlugin:
     deferred: bool = False
 
 
+@dataclass(frozen=True)
+class _HookRegistration:
+    """A hook callback plus safe attribution captured at registration time."""
+
+    callback: Callable
+    plugin_key: str
+
+
 @dataclass
 class PluginRegistration:
     """One host-owned registration made while loading a plugin.
@@ -3384,7 +3392,9 @@ class PluginContext:
         )
         return count
 
-    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
+    def register_hook(
+        self, hook_name: str, callback: Callable
+    ) -> PluginRegistration:
         """Register a lifecycle hook callback.
 
         Unknown hook names produce a warning but are still stored so
@@ -3398,12 +3408,16 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
+        registration = _HookRegistration(
+            callback=callback,
+            plugin_key=self.plugin_id,
+        )
         callbacks = self._manager._hooks.setdefault(hook_name, [])
-        callbacks.append(callback)
+        callbacks.append(registration)
         handle = self._track(
             "hook", hook_name,
             lambda: self._manager._remove_callback(
-                self._manager._hooks, hook_name, callback
+                self._manager._hooks, hook_name, registration
             ),
         )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
@@ -3787,7 +3801,7 @@ class PluginManager:
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
-        self._hooks: Dict[str, List[Callable]] = {}
+        self._hooks: Dict[str, List[Union[Callable, _HookRegistration]]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -5582,8 +5596,34 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _invoke_hook_callback(callback: Callable, payload: Dict[str, Any]) -> Any:
+    def _sanitize_hook_owner(value: object) -> str:
+        """Return bounded identifier-safe diagnostic ownership metadata."""
+        if not isinstance(value, str):
+            return "unknown"
+        sanitized = re.sub(r"[^A-Za-z0-9._/-]", "_", value)[:128]
+        return sanitized or "unknown"
+
+    @classmethod
+    def _hook_owner(cls, callback: Union[Callable, _HookRegistration]) -> str:
+        """Return sanitised hook ownership without inspecting hook payloads."""
+        if isinstance(callback, _HookRegistration):
+            return f"plugin:{cls._sanitize_hook_owner(callback.plugin_key)}"
+        module_name = getattr(callback, "__module__", "")
+        if isinstance(module_name, str) and module_name and module_name != "__main__":
+            return f"module:{cls._sanitize_hook_owner(module_name)}"
+        return "module:unknown"
+
+    @staticmethod
+    def _hook_callback(callback: Union[Callable, _HookRegistration]) -> Callable:
+        """Unwrap host-owned metadata while retaining legacy direct registrations."""
+        return callback.callback if isinstance(callback, _HookRegistration) else callback
+
+    @staticmethod
+    def _invoke_hook_callback(
+        callback: Union[Callable, _HookRegistration], payload: Dict[str, Any]
+    ) -> Any:
         """Invoke a hook while withholding additive fields from old callbacks."""
+        callback = PluginManager._hook_callback(callback)
         try:
             parameters = inspect.signature(callback).parameters
         except (TypeError, ValueError):
@@ -5665,7 +5705,9 @@ class PluginManager:
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
 
         for cb in callbacks:
-            callback_name = getattr(cb, "__name__", repr(cb))
+            raw_callback = self._hook_callback(cb)
+            callback_name = getattr(raw_callback, "__name__", type(raw_callback).__name__)
+            callback_owner = self._hook_owner(cb)
             callback_key = (hook_name, id(cb))
             try:
                 if use_timeout:
@@ -5705,19 +5747,21 @@ class PluginManager:
                                     + 1
                                 )
                                 logger.warning(
-                                    "Hook '%s' callback %s skipped: %d worker(s) "
+                                    "Hook '%s' callback %s (%s) skipped: %d worker(s) "
                                     "already in flight (max concurrency %d)",
                                     hook_name,
                                     callback_name,
+                                    callback_owner,
                                     running_count,
                                     max_concurrency,
                                 )
                             else:
                                 logger.warning(
-                                    "Hook '%s' callback %s skipped after previous "
+                                    "Hook '%s' callback %s (%s) skipped after previous "
                                     "timeout or while still running",
                                     hook_name,
                                     callback_name,
+                                    callback_owner,
                                 )
                             if fail_closed:
                                 results.append(_pre_tool_call_timeout_block())
@@ -5734,7 +5778,7 @@ class PluginManager:
                     failure: Dict[str, Exception] = {}
 
                     def _runner(
-                        _cb: Callable[..., Any] = cb,
+                        _cb: Union[Callable[..., Any], _HookRegistration] = cb,
                         _key: tuple = callback_key,
                         _token: object = token,
                     ) -> None:
@@ -5770,9 +5814,10 @@ class PluginManager:
                                 + self._hook_timeout_suppression_seconds
                             )
                         logger.warning(
-                            "Hook '%s' callback %s timed out after %gs — skipping",
+                            "Hook '%s' callback %s (%s) timed out after %gs — skipping",
                             hook_name,
                             callback_name,
+                            callback_owner,
                             timeout,
                         )
                         if fail_closed:
@@ -5787,10 +5832,11 @@ class PluginManager:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
-                    "Hook '%s' callback %s raised: %s",
+                    "Hook '%s' callback %s (%s) raised %s",
                     hook_name,
                     callback_name,
-                    exc,
+                    callback_owner,
+                    type(exc).__name__,
                 )
         return results
 
@@ -5997,7 +6043,10 @@ class PluginManager:
 
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
-        return tuple(self._hooks.get(hook_name, ()))
+        return tuple(
+            self._hook_callback(callback)
+            for callback in self._hooks.get(hook_name, ())
+        )
 
     def render_system_prompt_sections(
         self, session_info: Mapping[str, Any]
