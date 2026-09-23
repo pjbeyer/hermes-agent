@@ -234,22 +234,49 @@ class TestHealthyJobUnaffected:
         assert agent_constructed is True
 
     def test_recovery_clears_alert_marker(self, tmp_path):
-        """After a blocked tick, a healthy tick clears the alert-dedup marker
-        so a FUTURE config break re-alerts."""
+        """After a blocked tick that DELIVERED, a healthy tick clears the alert-dedup
+        marker so a FUTURE config break re-alerts.
+
+        Driven through ``run_one_job`` (which owns delivery) rather than ``run_job``:
+        the bit is claimed by the delivery path, and ``run_job`` never delivers — it
+        returns the tuple for its caller to deliver. Asserting the bit after a bare
+        ``run_job`` tested a state production cannot reach.
+        """
         job = _job()
+        fake_db = MagicMock()
+
+        def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
+            return None  # delivered
+
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
-            # Tick 1: blocked.
-            _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            # Tick 1: blocked and successfully alerted.
+            fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state_registry.acquire", return_value=fake_db), \
+                 patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
+                 patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                       side_effect=_AuthErrorFactory()), \
+                 patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+                 patch("run_agent.AIAgent"):
+                assert sched.run_one_job(fresh) is True
             stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
-            assert stored.get("preflight_alerted")
+            assert stored.get("preflight_alerted"), (
+                "a DELIVERED blocked-config alert must set the dedup bit so it "
+                f"does not repeat; got {stored.get('preflight_alerted')!r}"
+            )
             # Tick 2: key restored → healthy run clears the marker.
             fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
             success, *_rest, agent_constructed = _run_job_patched(fresh, tmp_path)
             assert success is True
             assert agent_constructed is True
             stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
-            assert not stored.get("preflight_alerted")
+            assert not stored.get("preflight_alerted"), (
+                "a healthy run must clear the bit so a FUTURE break re-alerts"
+            )
 
 
 class TestOptOut:
@@ -369,3 +396,104 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+
+class TestUndeliverableAlertRetriesUntilDelivered:
+    """The once-only alert bit must be claimed only AFTER a successful delivery.
+
+    Regression for the shape observed on a real Flex job (2026-09-21): a job blocked
+    by an unconfigured delivery platform delivered exactly one alert, that send failed
+    over the very platform named in the reason, and every later run then suppressed
+    delivery — so the block was reported zero times and stayed silent indefinitely.
+    """
+
+    @staticmethod
+    def _tick(job, tmp_path, fake_db, fail_delivery):
+        """Run one tick of a blocked job; return (deliveries, delivery_error)."""
+        deliveries = []
+
+        def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
+            deliveries.append(content)
+            return "platform 'discord' not configured/enabled" if fail_delivery else None
+
+        fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
+             patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_AuthErrorFactory()), \
+             patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            ok = sched.run_one_job(fresh)
+            assert ok is True
+            assert mock_agent_cls.called is False
+        return deliveries
+
+    def test_failed_delivery_leaves_bit_clear_and_re_alert_next_tick(self, tmp_path):
+        """A failed send must NOT consume the once-only bit (the reported bug)."""
+        job = _job()
+        fake_db = MagicMock()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            first = self._tick(job, tmp_path, fake_db, fail_delivery=True)
+            stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            assert stored.get("preflight_alerted") is not True, (
+                "a FAILED delivery must leave the once-only bit clear, "
+                f"got preflight_alerted={stored.get('preflight_alerted')!r}"
+            )
+            # The alert is still 'blocked_config' (not the silent variant), so the
+            # next tick re-attempts delivery rather than suppressing it.
+            assert stored["last_status"] == "blocked_config"
+
+            second = self._tick(job, tmp_path, fake_db, fail_delivery=True)
+            stored2 = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+
+        assert len(first) == 1, f"first tick must attempt an alert, got {first!r}"
+        assert len(second) == 1, (
+            "a still-undelivered alert MUST be re-attempted on the next tick, "
+            f"got {second!r}"
+        )
+        assert stored2.get("preflight_alerted") is not True, (
+            "bit must still be clear after a second failed send"
+        )
+
+    def test_successful_delivery_sets_bit_and_suppresses_repeat(self, tmp_path):
+        """Once delivered, later ticks stay quiet — the once-only contract holds."""
+        job = _job()
+        fake_db = MagicMock()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            first = self._tick(job, tmp_path, fake_db, fail_delivery=False)
+            stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            assert stored.get("preflight_alerted") is True, (
+                "a DELIVERED alert must set the bit, "
+                f"got {stored.get('preflight_alerted')!r}"
+            )
+
+            second = self._tick(job, tmp_path, fake_db, fail_delivery=False)
+
+        assert len(first) == 1, f"first tick delivers the alert, got {first!r}"
+        assert second == [], (
+            f"a delivered alert must not repeat, got {second!r}"
+        )
+
+    def test_delivered_then_failing_again_re_alerts_only_after_recovery(self, tmp_path):
+        """Delivery failure after a success does not silently re-arm a storm: the bit
+        stays set until a healthy run clears it, so the operator is not re-paged."""
+        job = _job()
+        fake_db = MagicMock()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            first = self._tick(job, tmp_path, fake_db, fail_delivery=False)
+            # Bit is now set; a subsequent failed send does not re-alert (still once).
+            second = self._tick(job, tmp_path, fake_db, fail_delivery=True)
+            stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+
+        assert len(first) == 1
+        assert second == [], f"already-delivered alert must not repeat: {second!r}"
+        assert stored.get("preflight_alerted") is True, (
+            "an already-delivered alert keeps the bit set so it does not storm"
+        )

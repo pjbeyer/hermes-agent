@@ -1692,17 +1692,24 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
 
 
 def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
-    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job."""
+    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job.
+
+    The once-only dedup bit is NOT consumed here. It was, and that made the alert
+    undeliverable by construction: the bit was set before delivery was attempted,
+    and delivery goes to the job's own configured platform — which is frequently the
+    very platform whose absence produced the block (``delivery platform 'discord' not
+    configured/enabled``). The first blocked run set the bit and failed to deliver;
+    every later run then carried ``BLOCKED_CONFIG_SILENT_MARKER``, which suppresses
+    delivery, while the operator-visible document still claimed "this alert is not
+    repeated" — true, and together with the failed send it guaranteed permanent
+    silence.
+
+    The bit is now claimed by the delivery path instead
+    (``_consume_blocked_config_alert``), and only once the notice actually left.
+    """
     logger.warning(
         "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
         job_name, job_id, _pf_reason)
-    already_alerted = False
-    try:
-        from cron.jobs import mark_preflight_alerted
-        already_alerted = mark_preflight_alerted(job_id)
-    except Exception:
-        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
-    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
     blocked_doc = (
         f"# Cron Job: {job_name}\n\n"
         f"**Job ID:** {job_id}\n"
@@ -1712,10 +1719,36 @@ def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple
         "(nothing was charged).\n\n"
         f"**Reason:** {_pf_reason}\n\n"
         "Hermes tries again at the next scheduled time and clears this state on the first healthy "
-        "run; this alert is not repeated. Check with `hermes cron doctor`. Set `cron.preflight: "
+        "run. This alert repeats until it is delivered, so a delivery outage cannot silence it. "
+        "Check with `hermes cron doctor`. Set `cron.preflight: "
         "false` in config.yaml to disable this check."
     )
-    return False, blocked_doc, "", f"{marker} {_pf_reason}"
+    return False, blocked_doc, "", f"{BLOCKED_CONFIG_MARKER} {_pf_reason}"
+
+
+def _consume_blocked_config_alert(job_id: str, delivery_error: Optional[str]) -> bool:
+    """Claim the once-only ``blocked_config`` alert bit, but only if the notice left.
+
+    Returns True when this run's alert was already delivered once (or delivery was
+    confirmed), so the caller may use the silent marker / suppress repeats.
+
+    Ordering is the whole point: a delivery failure must leave the bit clear so the
+    next blocked run re-alerts. Marking it first is what turned a broken delivery
+    platform into permanent silence.
+
+    Best-effort: a store error returns the PRIOR bit so a transient store failure
+    never manufactures a duplicate alert storm.
+    """
+    if delivery_error:
+        # Not delivered — leave the bit clear so the next run tries again.
+        return False
+    try:
+        from cron.jobs import mark_preflight_alerted
+        return mark_preflight_alerted(job_id)
+    except Exception:
+        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
+        return True
+
 
 
 def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[dict, str]:
@@ -2824,8 +2857,14 @@ def _compose_run_delivery(
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
-    blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
-    blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
+    blocked_config = BLOCKED_CONFIG_SILENT_MARKER in err or BLOCKED_CONFIG_MARKER in err
+    # Once-only contract: suppress only when the bit says an alert was ALREADY DELIVERED
+    # (set by _finish_completed_run after a successful send). A blocked-config run with a
+    # clean bit is NOT silent — it must be delivered, because the bit is only set once the
+    # notice actually leaves. The legacy [blocked_config:silent] marker is no longer
+    # produced, but a job record written by an older build can carry it, so honour both.
+    blocked_config_silent = bool(job.get("preflight_alerted")) or \
+        BLOCKED_CONFIG_SILENT_MARKER in err
     incident_acked = False
     failure_incident_id = None
     if blocked_config and not success:
@@ -3061,6 +3100,15 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["quota_hold_seconds"] = _hold_s
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
+    if d.blocked_config:
+        # Claim the once-only alert bit AFTER the delivery attempt, and only if the
+        # notice actually left. This ordering IS the fix: marking it before the send
+        # (the old behaviour, inside _blocked_config_result) consumed the alert on a
+        # run whose delivery failed over the very platform named in the block reason,
+        # so every later run suppressed delivery and the block stayed silent forever.
+        # _compose_run_delivery already consumed the PRIOR bit for this run's decision,
+        # so setting it here does not change what this run delivered.
+        _consume_blocked_config_alert(d.job["id"], d.delivery_error)
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
