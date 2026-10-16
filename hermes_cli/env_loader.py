@@ -725,6 +725,18 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         if src.applied:
             print(f"  {src.label}: applied {len(src.applied)} "
                   f"secret{'s' if len(src.applied) != 1 else ''}", file=sys.stderr)
+        # A degraded pull resolves some references and not others. Without this
+        # line the only sign is a later, unrelated-looking "not found in
+        # environment" from whichever consumer needed the missing credential —
+        # the failure surfaces far from its cause.
+        unresolved = getattr(src.result, "unresolved", None) or {}
+        if unresolved:
+            names = ", ".join(sorted(unresolved))
+            print(f"  {src.label}: DEGRADED — {len(unresolved)} of "
+                  f"{len(unresolved) + len(src.applied)} requested secret(s) unresolved: {names}",
+                  file=sys.stderr)
+            for name in sorted(unresolved):
+                print(f"  {src.label}:   {name}: {unresolved[name]}", file=sys.stderr)
         if src.result.error:
             print(f"  {src.label}: {src.result.error}", file=sys.stderr)
             hint = _remediation_hint(src.name, src.result.error_kind, cfg, scope=home_key)

@@ -607,11 +607,12 @@ def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monk
     import agent.secret_sources.onepassword as op_module
 
     monkeypatch.setattr(op_module, "find_op", lambda *_a, **_kw: Path("/fake/op"))
-    monkeypatch.setattr(
-        op_module,
-        "fetch_onepassword_secrets",
-        lambda **_kw: ({"ANTHROPIC_API_KEY": "sk-ant-test"}, []),
-    )
+    def _fake_op_fetch(**_kw):
+        res = op_module.FetchResult()
+        res.secrets = {"ANTHROPIC_API_KEY": "sk-ant-test"}
+        return res
+
+    monkeypatch.setattr(op_module, "fetch_onepassword_result", _fake_op_fetch)
 
     from agent.secret_sources import registry as reg_module
 
@@ -665,11 +666,11 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
 
     def _fake_fetch(**kwargs):
         captured.update(kwargs)
-        return {}, []
+        return op_module.FetchResult()
 
     import agent.secret_sources.onepassword as op_module
     monkeypatch.setattr(op_module, "find_op", lambda *_a, **_kw: Path("/fake/op"))
-    monkeypatch.setattr(op_module, "fetch_onepassword_secrets", _fake_fetch)
+    monkeypatch.setattr(op_module, "fetch_onepassword_result", _fake_fetch)
 
     from agent.secret_sources import registry as reg_module
 

@@ -113,10 +113,34 @@ class FetchResult:
     error_kind: Optional[ErrorKind] = None
     # Helper binary used (CLI-driven sources); surfaced by status commands.
     binary_path: Optional[Path] = None
+    # Names this source was asked for but could NOT resolve, with the reason for
+    # each. ``ok`` alone cannot express this: a source that resolved 31 of 32
+    # references sets no ``error``, so it reports ``ok`` while silently supplying
+    # a credential set that is missing an entry. Consumers that treat ``ok`` as
+    # "every requested credential is present" then fail later with a misleading
+    # "not found in environment" that hides the real cause.
+    #
+    # Kept separate from ``warnings`` (which also carries advisory, non-failure
+    # text such as invalid-name skips) so a caller can distinguish a degraded
+    # pull from a noisy-but-complete one without parsing strings.
+    unresolved: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    @property
+    def ok_fully(self) -> bool:
+        """True only when the source failed at nothing: no error AND every
+        requested reference resolved. Use this (not ``ok``) when the caller's
+        correctness depends on the complete credential set being present."""
+        return self.error is None and not self.unresolved
+
+    @property
+    def partial(self) -> bool:
+        """True when the source failed at nothing but could not resolve every
+        reference — a degraded pull whose resolved values are still usable."""
+        return self.error is None and bool(self.unresolved)
 
     def fail(self, error: str, kind: ErrorKind) -> FetchResult:
         self.error, self.error_kind = error, kind

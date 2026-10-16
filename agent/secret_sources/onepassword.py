@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 
 _OP_RUN_TIMEOUT = 30
 
+# A vault/network blip fails every reference in a single run (observed: all 32
+# references failing within the same second). One attempt therefore turns a
+# momentary fault into a fully degraded pull, so transient kinds are retried.
+_OP_READ_ATTEMPTS = 3
+_OP_RETRY_BACKOFF_SECONDS = 0.5
+
+# Only these kinds are worth retrying: they describe the transport, not the
+# request. A bad reference, a rejected credential, or an empty value is
+# deterministic and must fail immediately.
+_TRANSIENT_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT})
+
 # `op` itself reads OP_SERVICE_ACCOUNT_TOKEN; `service_account_token_env` lets
 # the user source it from another name, and _op_child_env normalizes it back.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
@@ -65,14 +76,28 @@ _MISSING_BINARY_HINT = (
     "or set secrets.onepassword.binary_path."
 )
 
-# First matching rule wins.
+# First matching rule wins, so a transport failure must be recognised BEFORE the
+# authentication rule. The observed outage reports both in one message:
+#
+#   error initializing client: Authentication: (failed to auth.LookupAuth),
+#   Network: (failed to request...)
+#
+# `op` cannot distinguish "the token was rejected" from "the request never left
+# the machine", so it reports both. Matching `authentication` first classified a
+# transport outage as AUTH_FAILED, which is not retryable — the retry would have
+# never fired on the very failure it exists for. Ordering NETWORK ahead of
+# AUTH_FAILED is also the conservative reading: a genuinely rejected credential
+# still fails on every attempt, so treating an ambiguous message as transient
+# costs at most a short bounded delay, whereas treating a transport blip as a
+# credential fault loses the whole pull.
 _OP_ERROR_RULES = (
     (ErrorKind.TIMEOUT, ("timed out",)),
     (ErrorKind.BINARY_MISSING, ("not found on path", "not an executable", "failed to invoke")),
+    (ErrorKind.NETWORK, ("network", "connection", "resolve host", "dns",
+                         "failed to request", "failed to auth.lookupauth")),
     (ErrorKind.AUTH_FAILED, ("unauthorized", "not signed in", "session expired",
                              "authentication", "401", "403")),
     (ErrorKind.EMPTY_VALUE, ("empty value",)),
-    (ErrorKind.NETWORK, ("network", "connection", "resolve host", "dns")),
 )
 
 
@@ -161,6 +186,33 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     return value
 
 
+def _read_with_retry(op: Path, reference: str, *, account: str = "", token_value: str = "",
+                     attempts: int = _OP_READ_ATTEMPTS,
+                     sleep: Optional[Callable[[float], None]] = None) -> str:
+    """Resolve one reference, retrying only *transient* failures.
+
+    A vault/network blip fails every reference in the same run, so without a
+    retry a single transient fault degrades the whole pull. Retrying is safe for
+    transport faults and pointless (or harmful) for the rest: a bad reference or
+    rejected credential will fail identically on every attempt, and retrying an
+    auth failure just delays a failure the user must fix.
+
+    Sleeps with linear backoff between attempts; ``sleep`` is injectable so tests
+    don't wait.
+    """
+    _sleep = sleep or time.sleep
+    last: RuntimeError = RuntimeError(f"op read produced no result for {reference!r}")
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return _run_op_read(op, reference, account=account, token_value=token_value)
+        except RuntimeError as exc:
+            last = exc
+            if attempt >= attempts or _classify_op_error(str(exc)) not in _TRANSIENT_KINDS:
+                raise
+            _sleep(_OP_RETRY_BACKOFF_SECONDS * attempt)
+    raise last
+
+
 def fetch_onepassword_secrets(
     *, references: dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
@@ -171,10 +223,37 @@ def fetch_onepassword_secrets(
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
     failures become warnings. Only a complete, error-free pull is cached, so a
     transient auth failure isn't frozen in for the whole TTL window.
+
+    Callers that need to know whether the pull was complete should use
+    :func:`fetch_onepassword_result`, which also reports which references could
+    not be resolved. This tuple-returning form is retained for compatibility.
     """
+    result = fetch_onepassword_result(
+        references=references, account=account, token_env=token_env, binary=binary,
+        binary_path=binary_path, use_cache=use_cache, cache_ttl_seconds=cache_ttl_seconds,
+        home_path=home_path)
+    return result.secrets, result.warnings
+
+
+def fetch_onepassword_result(
+    *, references: dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
+    binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
+    cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
+    retry_sleep: Optional[Callable[[float], None]] = None,
+) -> FetchResult:
+    """Resolve ``references`` into a :class:`FetchResult`.
+
+    Unlike the tuple form this distinguishes a *complete* pull from a *degraded*
+    one: references that could not be resolved are recorded in
+    ``result.unresolved`` (name → reason), and ``result.partial`` is True when
+    some but not all resolved. Raises ``RuntimeError`` only when no ``op`` binary
+    is available.
+    """
+    result = FetchResult()
     valid, warnings = _validate_references(references)
+    result.warnings.extend(warnings)
     if not valid:
-        return {}, warnings
+        return result
 
     token_value = get_source_environment().get(token_env, "").strip()
     cache_key: _CacheKey = (_auth_fingerprint(token_env), account or "",
@@ -183,7 +262,10 @@ def fetch_onepassword_secrets(
     if use_cache:
         cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
         if cached is not None:
-            return dict(cached.secrets), warnings
+            # A cache hit only exists for a complete pull (see the store guard
+            # below), so nothing is unresolved.
+            result.secrets = dict(cached.secrets)
+            return result
 
     op = binary or find_op(binary_path)
     if op is None:
@@ -191,20 +273,22 @@ def fetch_onepassword_secrets(
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: dict[str, str] = {}
-    read_errors = 0
     for name in sorted(valid):
         try:
-            secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
+            result.secrets[name] = _read_with_retry(
+                op, valid[name], account=account, token_value=token_value, sleep=retry_sleep)
         except RuntimeError as exc:
-            warnings.append(str(exc))
-            read_errors += 1
+            # Record BOTH the human-readable warning (kept for existing consumers
+            # and logs) and the structured entry, so a caller never has to parse
+            # warning text to learn which credential is missing.
+            result.warnings.append(str(exc))
+            result.unresolved[name] = _scrub(str(exc))[:200]
 
-    if use_cache and not read_errors and secrets:
-        _STORE.store(cache_key, CachedFetch(secrets=dict(secrets), fetched_at=time.time()),
+    if use_cache and not result.unresolved and result.secrets:
+        _STORE.store(cache_key, CachedFetch(secrets=dict(result.secrets), fetched_at=time.time()),
                      cache_ttl_seconds, home_path)
 
-    return secrets, warnings
+    return result
 
 
 def _missing_binary_error(binary_path: str) -> str:
@@ -316,15 +400,22 @@ class OnePasswordSource(SecretSource):
             return result.fail(_missing_binary_error(binary_path), ErrorKind.BINARY_MISSING)
 
         try:
-            secrets, fetch_warnings = fetch_onepassword_secrets(
+            fetched = fetch_onepassword_result(
                 references=valid, account=str(cfg.get("account") or ""), token_env=self.token_env(cfg),
                 binary=binary, cache_ttl_seconds=coerce_float(cfg.get("cache_ttl_seconds", 300), 300.0),
                 home_path=home_path)
         except RuntimeError as exc:
             return result.fail(str(exc), _classify_op_error(str(exc)))
 
-        result.secrets = secrets
-        result.warnings.extend(fetch_warnings)
+        result.secrets = fetched.secrets
+        result.warnings.extend(fetched.warnings)
+        # A degraded pull must not present as a clean one. Carry the structured
+        # list up so the orchestrator (and the operators reading cron output) can
+        # see WHICH credential is missing and why, instead of inferring it from a
+        # downstream "not found in environment".
+        result.unresolved.update(fetched.unresolved)
+        if result.unresolved and not result.error:
+            result.error_kind = _classify_op_error(" ".join(result.unresolved.values()))
         return result
 
 

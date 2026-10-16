@@ -307,6 +307,174 @@ def test_apply_never_overrides_token_var(monkeypatch, tmp_path):
     assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "original"
     assert calls["n"] == 0
 
+# ---------------------------------------------------------------------------
+# Partial resolution must not present as a clean pull (regression)
+#
+# A vault/network blip fails every reference in one run. Before the fix the
+# per-reference failures were collected as warnings only, so the fetch reported
+# ok=True while supplying a credential set with entries missing. The consumer
+# then failed later with "not found in environment", naming the symptom and
+# hiding the cause.
+# ---------------------------------------------------------------------------
 
 
+def _flaky_read(fail_refs, error="could not read secret: Network: (failed to request)"):
+    """subprocess.run stub: references in ``fail_refs`` fail, others succeed."""
+    calls = {"n": 0}
 
+    def _run(cmd, **kwargs):
+        calls["n"] += 1
+        ref = cmd[-1]
+        if ref in fail_refs:
+            return _err(1, f"[ERROR] could not read secret {ref}: {error}")
+        return _ok(f"value-for-{ref}")
+
+    return _run, calls
+
+
+def test_partial_resolution_is_reported_as_partial_not_ok(monkeypatch, tmp_path):
+    """A pull that resolved some but not all references is flagged, and names
+    the missing credential."""
+    refs = {"GOOD_TOKEN": "op://Vault/Item/good", "MISSING_TOKEN": "op://Vault/Item/missing"}
+    run, _ = _flaky_read({"op://Vault/Item/missing"})
+    monkeypatch.setattr(op.subprocess, "run", run)
+
+    result = op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=False,
+        home_path=tmp_path, retry_sleep=lambda _s: None)
+
+    # The values that DID resolve are still supplied (a degraded pull stays useful).
+    assert result.secrets == {"GOOD_TOKEN": "value-for-op://Vault/Item/good"}
+    # ...but the pull is not presented as clean.
+    assert result.unresolved, "a failed reference must be recorded as unresolved"
+    assert "MISSING_TOKEN" in result.unresolved
+    assert result.partial is True
+    assert result.ok_fully is False
+
+
+def test_fully_resolved_pull_reports_ok_fully(monkeypatch, tmp_path):
+    """The control: a complete pull is not flagged (the check must not be
+    vacuous — a fix that always reports degraded would also pass the test
+    above)."""
+    refs = {"A_TOKEN": "op://Vault/Item/a", "B_TOKEN": "op://Vault/Item/b"}
+    run, _ = _flaky_read(set())
+    monkeypatch.setattr(op.subprocess, "run", run)
+
+    result = op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=False,
+        home_path=tmp_path, retry_sleep=lambda _s: None)
+
+    assert result.ok_fully is True
+    assert result.partial is False
+    assert result.unresolved == {}
+
+
+def test_transient_network_failure_is_retried_and_recovers(monkeypatch, tmp_path):
+    """A transport blip must not degrade the pull on its first occurrence."""
+    refs = {"A_TOKEN": "op://Vault/Item/a"}
+    calls = {"n": 0}
+
+    def _run(cmd, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _err(1, "[ERROR] error initializing client: Authentication: "
+                            "(failed to auth.LookupAuth), Network: (failed to request)")
+        return _ok("recovered-value")
+
+    monkeypatch.setattr(op.subprocess, "run", _run)
+    slept = []
+    result = op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=False,
+        home_path=tmp_path, retry_sleep=slept.append)
+
+    assert calls["n"] == 2, "a transient failure must be retried"
+    assert result.secrets == {"A_TOKEN": "recovered-value"}
+    assert result.unresolved == {}
+    assert slept, "retry must back off rather than spin"
+
+
+def test_real_outage_error_text_is_classified_transient():
+    """Pin the classification of the ACTUAL production error.
+
+    The outage reports an auth failure and a network failure in one message, and
+    the rules are first-match-wins. With `authentication` matched first the
+    message classified as AUTH_FAILED (non-retryable), so the retry added above
+    would never have fired on the real failure — the fix would have looked
+    correct while doing nothing in production.
+    """
+    real = ("op read failed for 'op://Vault/Item/x': [ERROR] could not read secret "
+            "'op://Vault/Item/x': error initializing client: Authentication: "
+            "(failed to auth.LookupAuth), Network: (failed to request)")
+    kind = op._classify_op_error(real)
+    assert kind in op._TRANSIENT_KINDS, (
+        f"the real outage message classified as {kind.value}, which is not retried — "
+        "the retry would be dead code in production")
+    # A genuinely rejected credential must still be non-retryable.
+    assert op._classify_op_error("is not signed in") not in op._TRANSIENT_KINDS
+    assert op._classify_op_error("401 Unauthorized") not in op._TRANSIENT_KINDS
+
+
+def test_non_transient_failure_is_not_retried(monkeypatch, tmp_path):
+    """A bad reference is deterministic: retrying wastes the wall-clock budget
+    and delays a failure the user must fix."""
+    refs = {"A_TOKEN": "op://Vault/Item/a"}
+    calls = {"n": 0}
+
+    def _run(cmd, **kwargs):
+        calls["n"] += 1
+        return _err(1, "[ERROR] could not read secret: is not signed in")
+
+    monkeypatch.setattr(op.subprocess, "run", _run)
+    result = op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=False,
+        home_path=tmp_path, retry_sleep=lambda _s: None)
+
+    assert calls["n"] == 1, "an auth failure must fail fast, not retry"
+    assert "A_TOKEN" in result.unresolved
+
+
+def test_degraded_pull_is_not_cached(monkeypatch, tmp_path):
+    """A degraded pull must not be frozen for the TTL: caching it would serve a
+    missing credential for the whole window even after the vault recovers."""
+    refs = {"GOOD_TOKEN": "op://Vault/Item/good", "MISSING_TOKEN": "op://Vault/Item/missing"}
+    run, _ = _flaky_read({"op://Vault/Item/missing"})
+    monkeypatch.setattr(op.subprocess, "run", run)
+
+    op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=True,
+        cache_ttl_seconds=300, home_path=tmp_path, retry_sleep=lambda _s: None)
+
+    # A second call must re-attempt rather than serve a cached degraded set.
+    calls = {"n": 0}
+    def _count(cmd, **kwargs):
+        calls["n"] += 1
+        return _ok("v")
+    monkeypatch.setattr(op.subprocess, "run", _count)
+    op.fetch_onepassword_result(
+        references=refs, binary=Path("/usr/local/bin/op"), use_cache=True,
+        cache_ttl_seconds=300, home_path=tmp_path, retry_sleep=lambda _s: None)
+    assert calls["n"] > 0, "a degraded pull must not be served from cache"
+
+
+# ---------------------------------------------------------------------------
+# Wiring: the SOURCE the orchestrator actually calls must carry the signal.
+# Testing fetch_onepassword_result alone would stay green even if
+# OnePasswordSource.fetch dropped the field on the floor.
+# ---------------------------------------------------------------------------
+
+
+def test_source_fetch_surfaces_unresolved(monkeypatch, tmp_path):
+    run, _ = _flaky_read({"op://Vault/Item/missing"})
+    monkeypatch.setattr(op.subprocess, "run", run)
+
+    src = op.OnePasswordSource()
+    cfg = {"enabled": True, "cache_ttl_seconds": 0,
+           "env": {"GOOD_TOKEN": "op://Vault/Item/good",
+                   "MISSING_TOKEN": "op://Vault/Item/missing"}}
+    result = src.fetch(cfg, tmp_path)
+
+    assert result.secrets, "resolved values must still be supplied"
+    assert "MISSING_TOKEN" in result.unresolved, (
+        "OnePasswordSource.fetch must propagate unresolved references; "
+        "dropping them here makes the whole fix decorative")
+    assert result.partial is True

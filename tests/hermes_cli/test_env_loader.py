@@ -622,3 +622,60 @@ def test_dotenv_published_dashboard_session_token_still_reloads(tmp_path, monkey
     (home / ".env").write_text("HERMES_DASHBOARD_SESSION_TOKEN=second\n", encoding="utf-8")
     load_hermes_dotenv(hermes_home=home)
     assert os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] == "second"
+
+
+# ---------------------------------------------------------------------------
+# A degraded external secret source must say so on the operator-visible channel.
+#
+# The unresolved references have to reach a channel that shows up in cron output,
+# not stderr-only warnings buried among one line per reference. Without this, the
+# only sign of a degraded pull is a later "not found in environment" from
+# whichever consumer needed the missing credential — the failure surfaces far
+# from its cause. This drives the real entry point so that reverting the
+# surfacing line fails the test (a helper-level assertion would stay green).
+# ---------------------------------------------------------------------------
+
+
+def test_degraded_source_reports_unresolved_on_status_channel(tmp_path, monkeypatch, capsys):
+    from agent.secret_sources.base import FetchResult, SecretSource
+    from agent.secret_sources import registry as reg
+    from hermes_cli import env_loader
+
+    class DegradedSource(SecretSource):
+        name = "fakeop"
+        label = "FakeOP"
+        shape = "mapped"
+        scheme = "fakeop"
+
+        def is_enabled(self, cfg):
+            return True
+
+        def fetch(self, cfg, home_path):
+            r = FetchResult()
+            r.secrets = {"GOOD_TOKEN": "value"}
+            r.unresolved = {"MISSING_TOKEN": "op read failed: Network: (failed to request)"}
+            return r
+
+    degraded = DegradedSource().fetch({}, tmp_path)
+    # Use the real SourceReport so the stub cannot drift from the contract the
+    # production code reads (an earlier hand-rolled stub was missing a field and
+    # failed inside the code under test rather than at the assertion).
+    src_report = reg.SourceReport(name="fakeop", label="FakeOP", result=degraded)
+    src_report.applied = ["GOOD_TOKEN"]
+    src_report.skipped_existing = []
+
+    monkeypatch.setattr(env_loader, "_load_secrets_config", lambda _h: {"fakeop": {"enabled": True}})
+    monkeypatch.setattr(env_loader, "_SECRET_SOURCE_VALUES_BY_HOME", {}, raising=False)
+    monkeypatch.setattr(env_loader, "_SECRET_SOURCE_RESTORE_BY_HOME", {}, raising=False)
+    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set(), raising=False)
+    monkeypatch.setattr(reg, "apply_all", lambda cfg, home: type("R", (), {
+        "sources": [src_report], "applied_any": True,
+        "provenance": {}, "conflicts": []})())
+
+    env_loader._apply_external_secret_sources(tmp_path)
+    err = capsys.readouterr().err
+
+    assert "DEGRADED" in err, (
+        "a degraded pull must announce itself; reverting the surfacing line makes "
+        "this fix invisible in production")
+    assert "MISSING_TOKEN" in err, "the operator must learn WHICH credential is missing"

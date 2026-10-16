@@ -329,10 +329,12 @@ class TestOnePasswordSource:
                            "BW_ONLY": "bw-val"}, []),
         )
         monkeypatch.setattr(op, "find_op", lambda *_a, **_kw: Path("/fake/op"))
-        monkeypatch.setattr(
-            op, "fetch_onepassword_secrets",
-            lambda **kw: ({"SHARED_KEY": "from-1password"}, []),
-        )
+        def _fake_op_fetch(**kw):
+            res = op.FetchResult()
+            res.secrets = {"SHARED_KEY": "from-1password"}
+            return res
+
+        monkeypatch.setattr(op, "fetch_onepassword_result", _fake_op_fetch)
         reg.register_source(bw.BitwardenSource())
         reg.register_source(op.OnePasswordSource())
         env = {"BWS_ACCESS_TOKEN": "0.token"}
